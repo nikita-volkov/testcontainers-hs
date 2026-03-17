@@ -14,8 +14,10 @@ module TestContainers.Docker.Reaper
   )
 where
 
-import Control.Monad (replicateM)
+import Control.Monad (replicateM, void)
 import Control.Monad.Trans.Resource (MonadResource, allocate)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.Text (Text, pack, unpack)
 import Data.Text.Encoding (encodeUtf8)
 import qualified Network.Socket as Socket
@@ -112,6 +114,17 @@ newRyukReaper host port = do
 
   pure ryuk
 
+-- | Reads exactly @n@ bytes from a socket, retrying until all bytes are
+-- received.
+recvExactly :: Socket.Socket -> Int -> IO ByteString
+recvExactly socket n = go ByteString.empty
+  where
+    go acc
+      | ByteString.length acc >= n = pure (ByteString.take n acc)
+      | otherwise = do
+          chunk <- Socket.recv socket (n - ByteString.length acc)
+          go (acc <> chunk)
+
 newReaper ::
   -- | Session id
   Text ->
@@ -123,7 +136,7 @@ newReaper sessionId ryuk =
         Socket.sendAll
           (ryukSocket ryuk)
           ("label=" <> encodeUtf8 label <> "=" <> encodeUtf8 value <> "\n")
-        _ <- Socket.recv (ryukSocket ryuk) 2
+        void $ recvExactly (ryukSocket ryuk) 4
         pure (),
       labels =
         [ (sessionIdLabel, sessionId)
