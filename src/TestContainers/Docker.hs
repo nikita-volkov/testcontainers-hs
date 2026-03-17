@@ -184,7 +184,6 @@ import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
 import Data.List (find, stripPrefix)
-import Data.Maybe (fromMaybe)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -207,9 +206,10 @@ import Network.HTTP.Types (statusCode)
 import qualified Network.Socket as Socket
 import Optics.Fold (pre)
 import Optics.Operators ((^?))
-import Optics.Optic ((%), (<&>))
+import Optics.Optic ((%))
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
+import System.Info (os)
 import System.IO (Handle, hClose)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Process as Process
@@ -672,11 +672,8 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  (hostSocketPath, containerSocketPath) <-
+    liftIO $ resolveDockerSocketPaths <$> lookupEnv "DOCKER_HOST"
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -684,7 +681,7 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts [(hostSocketPath, containerSocketPath)]
         & setExpose [ryukPort]
         & setWaitingFor (waitUntilMappedPortReachable ryukPort)
         & setRm True
@@ -693,6 +690,31 @@ createRyukReaper = do
         containerAddress ryukContainer ryukPort
 
   newRyukReaper ryukContainerAddress ryukContainerPort
+
+-- | Resolves the Docker socket paths for the host and container based on the
+-- @DOCKER_HOST@ environment variable and the current operating system.
+-- On Windows, Docker uses a named pipe instead of a Unix socket.
+resolveDockerSocketPaths :: Maybe String -> (Text, Text)
+resolveDockerSocketPaths mDockerHost =
+  case mDockerHost >>= stripPrefix "npipe://" of
+    Just pipePath ->
+      (pack pipePath, pack pipePath)
+    Nothing ->
+      case mDockerHost >>= stripPrefix "unix://" of
+        Just sockPath ->
+          (pack sockPath, "/var/run/docker.sock")
+        Nothing ->
+          if os == windowsOs
+            then (windowsDefaultDockerPipe, windowsDefaultDockerPipe)
+            else ("/var/run/docker.sock", "/var/run/docker.sock")
+
+-- | The OS string returned by 'System.Info.os' on Windows.
+windowsOs :: String
+windowsOs = "mingw32"
+
+-- | The default Docker named pipe path on Windows.
+windowsDefaultDockerPipe :: Text
+windowsDefaultDockerPipe = "//./pipe/docker_engine"
 
 -- | Kills a Docker container. `kill` is essentially @docker kill@.
 --
