@@ -11,8 +11,12 @@ jobs:
     name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest] # [macOS-latest, windows-latest] do not come with docker :(
+        os: 
+          - ubuntu-latest
+          - macos-26-intel
+          - windows-latest
         cabal: ["3.12.1.0"]
         ghc:
           - 9.2.8
@@ -21,22 +25,27 @@ jobs:
           - 9.8.2
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
       if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
 
-    - uses: haskell-actions/setup@v2.6.1
+    - uses: haskell-actions/setup@v2
       id: setup-haskell-cabal
       name: Setup Haskell
       with:
         ghc-version: ${{ matrix.ghc }}
         cabal-version: ${{ matrix.cabal }}
 
+    - name: Set up Docker
+      if: runner.os == 'macOS'
+      uses: docker/setup-docker-action@v5
+
     - name: Freeze
       run: |
         cabal freeze
-
-    - uses: actions/cache@v3
-      name: Cache ~/.cabal/store
+    
+    - name: Restore dependency cache
+      id: cache
+      uses: actions/cache/restore@v5
       with:
         path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
         key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
@@ -46,6 +55,14 @@ jobs:
         cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
         cabal build all
 
+    # Save the cache immediately after dependencies are built so that the
+    # populated store survives even if the build or test steps fail.
+    - name: Save dependency cache
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
     - name: Test
       run: |
         cabal test all
@@ -54,21 +71,22 @@ jobs:
     name: stack / ghc ${{ matrix.ghc }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         stack: ["2.7.5"]
         ghc: ["9.0.2"]
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v6
       if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
 
-    - uses: haskell-actions/setup@v2.6.1
+    - uses: haskell-actions/setup@v2
       name: Setup Haskell Stack
       with:
         ghc-version: ${{ matrix.ghc }}
         stack-version: ${{ matrix.stack }}
 
-    - uses: actions/cache@v3
+    - uses: actions/cache@v5
       name: Cache ~/.stack
       with:
         path: ~/.stack
