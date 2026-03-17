@@ -681,11 +681,13 @@ createRyukReaper = do
       pure $ case dockerHost of
         -- Windows Docker Desktop: named-pipe host → use the Docker-Desktop
         -- forwarded socket path inside the Linux container.
-        Just host | Just _ <- stripPrefix "npipe://" host ->
-          ("//var/run/docker.sock", "//var/run/docker.sock")
+        Just host
+          | Just _ <- stripPrefix "npipe://" host ->
+              ("//var/run/docker.sock", "//var/run/docker.sock")
         -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
-        Just host | Just socket <- stripPrefix "unix://" host ->
-          (socket, "/var/run/docker.sock")
+        Just host
+          | Just socket <- stripPrefix "unix://" host ->
+              (socket, "/var/run/docker.sock")
         -- Default: the standard Unix socket on Linux/macOS.
         _ ->
           ("/var/run/docker.sock", "/var/run/docker.sock")
