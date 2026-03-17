@@ -211,6 +211,7 @@ import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.IO (Handle, hClose)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Info (os)
 import qualified System.Process as Process
 import qualified System.Random as Random
 import System.Timeout (timeout)
@@ -674,23 +675,23 @@ createRyukReaper = do
   -- Determine the Docker socket location to bind-mount into the Ryuk
   -- container.  On Windows Docker Desktop the Docker daemon is reached via a
   -- named-pipe; we translate that to the Docker-Desktop special path that is
-  -- forwarded into Linux containers.
+  -- forwarded into Linux containers.  On Unix-like systems we use the Unix
+  -- socket, falling back to /var/run/docker.sock if DOCKER_HOST is not set.
   (dockerSocketSource, dockerSocketDest) <-
     liftIO $ do
       dockerHost <- lookupEnv "DOCKER_HOST"
-      pure $ case dockerHost of
-        -- Windows Docker Desktop: named-pipe host → use the Docker-Desktop
-        -- forwarded socket path inside the Linux container.
-        Just host
-          | Just _ <- stripPrefix "npipe://" host ->
-              ("//var/run/docker.sock", "//var/run/docker.sock")
-        -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
-        Just host
-          | Just socket <- stripPrefix "unix://" host ->
-              (socket, "/var/run/docker.sock")
-        -- Default: the standard Unix socket on Linux/macOS.
-        _ ->
-          ("/var/run/docker.sock", "/var/run/docker.sock")
+      pure $
+        if os == "mingw32"
+          then -- Windows: Docker Desktop forwards the socket via this special path.
+            ("//var/run/docker.sock", "//var/run/docker.sock")
+          else case dockerHost of
+            -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
+            Just host
+              | Just socket <- stripPrefix "unix://" host ->
+                  (socket, "/var/run/docker.sock")
+            -- Default: the standard Unix socket on Linux/macOS.
+            _ ->
+              ("/var/run/docker.sock", "/var/run/docker.sock")
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
