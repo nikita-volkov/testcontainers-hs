@@ -115,7 +115,8 @@ newRyukReaper host port = do
   pure ryuk
 
 -- | Reads exactly @n@ bytes from a socket, retrying until all bytes are
--- received.
+-- received.  Throws 'IOError' if the connection is closed before @n@ bytes
+-- are available.
 recvExactly :: Socket.Socket -> Int -> IO ByteString
 recvExactly socket n = go ByteString.empty
   where
@@ -123,7 +124,9 @@ recvExactly socket n = go ByteString.empty
       | ByteString.length acc >= n = pure (ByteString.take n acc)
       | otherwise = do
           chunk <- Socket.recv socket (n - ByteString.length acc)
-          go (acc <> chunk)
+          if ByteString.null chunk
+            then ioError (userError "recvExactly: connection closed before receiving all bytes")
+            else go (acc <> chunk)
 
 newReaper ::
   -- | Session id
