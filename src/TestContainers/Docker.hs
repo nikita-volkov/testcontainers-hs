@@ -184,7 +184,6 @@ import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
 import Data.List (find, stripPrefix)
-import Data.Maybe (fromMaybe)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -672,11 +671,26 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  -- Determine the Docker socket location to bind-mount into the Ryuk
+  -- container.  On Windows Docker Desktop the Docker daemon is reached via a
+  -- named-pipe; we translate that to the Docker-Desktop special path that is
+  -- forwarded into Linux containers.
+  (dockerSocketSource, dockerSocketDest) <-
+    liftIO $ do
+      dockerHost <- lookupEnv "DOCKER_HOST"
+      pure $ case dockerHost of
+        -- Windows Docker Desktop: named-pipe host → use the Docker-Desktop
+        -- forwarded socket path inside the Linux container.
+        Just host
+          | Just _ <- stripPrefix "npipe://" host ->
+              ("//var/run/docker.sock", "//var/run/docker.sock")
+        -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
+        Just host
+          | Just socket <- stripPrefix "unix://" host ->
+              (socket, "/var/run/docker.sock")
+        -- Default: the standard Unix socket on Linux/macOS.
+        _ ->
+          ("/var/run/docker.sock", "/var/run/docker.sock")
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -684,9 +698,12 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts [(pack dockerSocketSource, pack dockerSocketDest)]
         & setExpose [ryukPort]
-        & setWaitingFor (waitUntilMappedPortReachable ryukPort)
+        -- Wait for ryuk to log "Started" instead of probing the port.
+        -- Probing the port causes a spurious connect/disconnect that triggers
+        -- ryuk's reconnection timer; using the log avoids that race.
+        & setWaitingFor (waitForLogLine Stdout ("Started" `LazyText.isInfixOf`))
         & setRm True
 
   let (ryukContainerAddress, ryukContainerPort) =
