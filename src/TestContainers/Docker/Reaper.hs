@@ -114,8 +114,13 @@ newRyukReaper host port = do
 
   pure ryuk
 
--- | Open a TCP connection, retrying up to @n@ times with a 500 ms delay
--- between attempts to tolerate transient port-forwarding setup delays.
+-- | Delay between consecutive connection retries in microseconds (500 ms).
+connectRetryDelayUs :: Int
+connectRetryDelayUs = 500000
+
+-- | Open a TCP connection.  On failure, waits 'connectRetryDelayUs' and
+-- retries up to @n@ more times (so at most @n + 1@ total attempts).
+-- Throws the last 'IOException' when all attempts are exhausted.
 connectWithRetry :: Socket.AddrInfo -> Int -> IO Socket.Socket
 connectWithRetry addr = go
   where
@@ -133,7 +138,7 @@ connectWithRetry addr = go
           | n <= 0 -> ioError e
           | otherwise -> do
               Socket.close socket
-              threadDelay 500000 -- 0.5 s
+              threadDelay connectRetryDelayUs
               go (n - 1)
 
 -- | Reads exactly @n@ bytes from a socket, retrying until all bytes are
