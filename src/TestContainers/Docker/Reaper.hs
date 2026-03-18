@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module TestContainers.Docker.Reaper
   ( Reaper (..),
@@ -14,6 +15,8 @@ module TestContainers.Docker.Reaper
   )
 where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, try)
 import Control.Monad (replicateM, void)
 import Control.Monad.Trans.Resource (MonadResource, allocate)
 import Data.ByteString (ByteString)
@@ -90,12 +93,9 @@ newRyukReaper host port = do
                 Socket.defaultHints {Socket.addrSocketType = Socket.Stream}
           address <-
             head <$> Socket.getAddrInfo (Just hints) (Just (unpack host)) (Just (show port))
-          socket <-
-            Socket.socket
-              (Socket.addrFamily address)
-              (Socket.addrSocketType address)
-              (Socket.addrProtocol address)
-          Socket.connect socket (Socket.addrAddress address)
+          -- Retry connecting up to 20 times (10 s total) to tolerate the
+          -- port-forwarding setup delay on macOS / Lima-backed Docker.
+          socket <- connectWithRetry address 20
 
           -- Construct the reaper and regiter the session with it.
           -- Doing it here intead of in the teardown (like we did before)
@@ -113,6 +113,28 @@ newRyukReaper host port = do
       )
 
   pure ryuk
+
+-- | Open a TCP connection, retrying up to @n@ times with a 500 ms delay
+-- between attempts to tolerate transient port-forwarding setup delays.
+connectWithRetry :: Socket.AddrInfo -> Int -> IO Socket.Socket
+connectWithRetry addr = go
+  where
+    go n = do
+      socket <-
+        Socket.socket
+          (Socket.addrFamily addr)
+          (Socket.addrSocketType addr)
+          (Socket.addrProtocol addr)
+      result <- try (Socket.connect socket (Socket.addrAddress addr))
+      case result of
+        Right () ->
+          pure socket
+        Left (e :: IOException)
+          | n <= 0 -> ioError e
+          | otherwise -> do
+              Socket.close socket
+              threadDelay 500000 -- 0.5 s
+              go (n - 1)
 
 -- | Reads exactly @n@ bytes from a socket, retrying until all bytes are
 -- received.  Throws 'IOError' if the connection is closed before @n@ bytes
