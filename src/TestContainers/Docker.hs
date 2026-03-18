@@ -183,7 +183,7 @@ import Data.Aeson (decode')
 import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
-import Data.List (find)
+import Data.List (find, stripPrefix)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -208,8 +208,10 @@ import Optics.Fold (pre)
 import Optics.Operators ((^?))
 import Optics.Optic ((%), (<&>))
 import System.Directory (doesFileExist)
+import System.Environment (lookupEnv)
 import System.IO (Handle, hClose)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Info (os)
 import qualified System.Process as Process
 import qualified System.Random as Random
 import System.Timeout (timeout)
@@ -670,6 +672,25 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
+  -- Determine the host path of the Docker socket to bind-mount into the Ryuk
+  -- container.  On Windows, Docker Desktop exposes the daemon via a named pipe;
+  -- we mount that pipe at the conventional Unix socket path inside the Linux
+  -- container.  On other platforms we mount the Unix socket directly.
+  (dockerSocketSource, dockerSocketDest) <-
+    liftIO $ do
+      dockerHost <- lookupEnv "DOCKER_HOST"
+      pure $
+        if os == "mingw32"
+          then -- Windows Docker Desktop: daemon is a named pipe.
+            ("//./pipe/docker_engine", "/var/run/docker.sock")
+          else case dockerHost of
+            -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
+            Just host
+              | Just socket <- stripPrefix "unix://" host ->
+                  (socket, "/var/run/docker.sock")
+            -- Default: the standard Unix socket on Linux/macOS.
+            _ ->
+              ("/var/run/docker.sock", "/var/run/docker.sock")
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -677,9 +698,7 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        -- /var/run/docker.sock is the standard Docker daemon socket path on
-        -- Linux, macOS (Lima/Docker Desktop) and Windows (WSL2 backend).
-        & setVolumeMounts [("/var/run/docker.sock", "/var/run/docker.sock")]
+        & setVolumeMounts [(pack dockerSocketSource, pack dockerSocketDest)]
         & setExpose [ryukPort]
         -- Wait for ryuk to log "Started" instead of probing the port.
         -- Probing the port causes a spurious connect/disconnect that triggers
