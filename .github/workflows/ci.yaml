@@ -32,7 +32,7 @@ jobs:
           ghc-version: ${{ matrix.ghc }}
 
       - name: Generate the plan
-        run: cabal build all --dry-run
+        run: cabal build all --dry-run --enable-tests
 
       - name: Restore cached dependencies
         uses: actions/cache/restore@v5
@@ -46,7 +46,7 @@ jobs:
 
       - name: Install dependencies
         shell: bash
-        run: cabal build all --only-dependencies -j +RTS -A128m -n2m -N -RTS
+        run: cabal build all --only-dependencies --enable-tests -j +RTS -A128m -n2m -N -RTS
 
       - name: Save dependencies cache
         uses: actions/cache/save@v5
