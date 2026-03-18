@@ -8,8 +8,6 @@ on:
 
 jobs:
   cabal:
-    name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,49 +15,50 @@ jobs:
           - ubuntu-latest
           - macos-26-intel
           - windows-latest
-        cabal: ["3.12.1.0"]
         ghc:
-          - 9.8.2
+          - 9.8.4
+          
+    runs-on: ${{ matrix.os }}
+
+    name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
 
     steps:
-    - uses: actions/checkout@v6
-      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+      - uses: actions/checkout@v6
 
-    - uses: haskell-actions/setup@v2
-      id: setup-haskell-cabal
-      name: Setup Haskell
-      with:
-        ghc-version: ${{ matrix.ghc }}
-        cabal-version: ${{ matrix.cabal }}
+      - uses: haskell-actions/setup@v2
+        id: setup
+        name: Setup Haskell
+        with:
+          ghc-version: ${{ matrix.ghc }}
 
-    - name: Set up Docker
-      if: runner.os == 'macOS'
-      uses: docker/setup-docker-action@v5
+      - name: Generate the plan
+        run: cabal build all --dry-run
 
-    - name: Freeze
-      run: |
-        cabal freeze
-    
-    - name: Restore dependency cache
-      id: cache
-      uses: actions/cache/restore@v5
-      with:
-        path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
-        key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
+      - name: Restore cached dependencies
+        uses: actions/cache/restore@v5
+        id: cache
+        env:
+          key: ${{ runner.os }}-${{ steps.setup.outputs.cabal-version }}-${{ steps.setup.outputs.ghc-version }}-${{ github.job }}
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ env.key }}-${{ hashFiles('**/plan.json') }}
+          restore-keys: ${{ env.key }}
 
-    - name: Build
-      run: |
-        cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
-        cabal build all
+      - name: Install dependencies
+        shell: bash
+        run: cabal build all --only-dependencies -j +RTS -A128m -n2m -N -RTS
 
-    # Save the cache immediately after dependencies are built so that the
-    # populated store survives even if the build or test steps fail.
-    - name: Save dependency cache
-      uses: actions/cache/save@v5
-      with:
-        path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
-        key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Save dependencies cache
+        uses: actions/cache/save@v5
+        if: ${{ steps.cache.outputs.cache-primary-key != steps.cache.outputs.cache-matched-key }}
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
-    - name: Test
-      run: |
-        cabal test all
+      - name: Set up Docker
+        if: runner.os == 'macOS'
+        uses: docker/setup-docker-action@v5
+
+      - name: Test
+        run: |
+          cabal test all
