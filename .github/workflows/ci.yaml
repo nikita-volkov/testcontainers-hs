@@ -59,6 +59,38 @@ jobs:
         if: runner.os == 'macOS'
         uses: docker/setup-docker-action@v5
 
+      - name: Switch Docker to Linux containers mode
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # GitHub Actions windows-latest runners include Docker Desktop.
+          # Docker Desktop defaults to Windows containers mode on Windows Server 2025,
+          # so we switch it to Linux containers mode (backed by WSL2) before running tests.
+          $dockerCli = 'C:\Program Files\Docker\Docker\DockerCli.exe'
+          if (Test-Path $dockerCli) {
+            Write-Host "Switching Docker to Linux containers mode..."
+            & $dockerCli -SwitchDaemon
+            # Wait for the Linux Docker daemon to become ready (up to 60 s).
+            $timeout = 60
+            $elapsed = 0
+            do {
+              Start-Sleep 2
+              $elapsed += 2
+              $null = docker info 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "Docker is ready in Linux containers mode."
+                break
+              }
+              Write-Host "Waiting for Docker daemon... ($elapsed / $timeout s)"
+            } while ($elapsed -lt $timeout)
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Docker did not become ready within $timeout seconds."
+              exit 1
+            }
+          } else {
+            Write-Host "DockerCli.exe not found at $dockerCli; skipping mode switch."
+          }
+
       - name: Test
         run: |
           cabal test all
