@@ -62,6 +62,25 @@ jobs:
         path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
         key: ${{ steps.cache.outputs.cache-primary-key }}
 
+    - name: Wait for Docker to be ready
+      if: runner.os == 'Windows'
+      shell: pwsh
+      # Docker service may still be starting up when fast (cached) builds complete.
+      # Poll up to 60 seconds (30 attempts × 2 s) before giving up.
+      run: |
+        $maxAttempts = 30
+        for ($i = 0; $i -lt $maxAttempts; $i++) {
+          $output = docker info 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Docker is ready"
+            exit 0
+          }
+          Write-Output "Waiting for Docker ($i/$maxAttempts)..."
+          Start-Sleep -Seconds 2
+        }
+        Write-Error "Docker did not become ready"
+        exit 1
+
     - name: Test
       run: |
         cabal test all
