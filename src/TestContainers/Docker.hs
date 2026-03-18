@@ -192,7 +192,6 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as LazyText
 import Data.Text.Read (decimal)
 import GHC.Stack (withFrozenCallStack)
-import System.Info (os)
 import Network.HTTP.Client
   ( HttpException,
     Manager,
@@ -674,21 +673,21 @@ createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
   -- Build the socket volume mount list.
   --
-  -- On Windows, Docker Desktop 4.32+ automatically injects the Docker socket
-  -- into Linux containers at /var/run/docker.sock, so no explicit bind-mount
-  -- is needed or possible.  The Docker CLI on Windows rejects every Unix-style
-  -- or named-pipe path as an "invalid volume specification", so we pass an
-  -- empty list and let Docker Desktop handle socket forwarding automatically.
+  -- When the Docker server is running in Windows containers mode (server OS =
+  -- "windows"), Docker handles socket access differently via named pipes, so we
+  -- pass an empty list.
   --
-  -- On other platforms, we bind-mount the Unix socket explicitly.  We honour
-  -- the DOCKER_HOST env var so that non-default socket locations (e.g.
-  -- Podman, Colima, custom Docker contexts) also work.
+  -- On all other platforms (Linux, macOS, or Windows with a Linux Docker
+  -- daemon accessed via TCP / WSL2), we bind-mount the Unix socket explicitly.
+  -- We honour the DOCKER_HOST env var so that non-default socket locations
+  -- (e.g. Podman, Colima, custom Docker contexts) also work.
+  serverOs <- dockerHostOs
   socketMounts <-
     liftIO $ do
       dockerHost <- lookupEnv "DOCKER_HOST"
       pure $
-        if os == "mingw32"
-          then -- Docker Desktop (Windows): socket is injected automatically.
+        if serverOs == "windows"
+          then -- Windows containers mode: Docker manages socket access.
             []
           else case dockerHost of
             -- Explicit unix socket, e.g. "unix:///run/podman/podman.sock".

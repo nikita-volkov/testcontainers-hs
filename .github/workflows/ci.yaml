@@ -56,8 +56,33 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Set up Docker
-        if: runner.os == 'macOS' || runner.os == 'Windows'
+        if: runner.os == 'macOS'
         uses: docker/setup-docker-action@v5
+
+      - name: Set up Linux Docker in WSL2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # GitHub Actions windows-latest (Server 2025) has Docker Engine in
+          # Windows containers mode.  Linux containers require a separate daemon.
+          # We install Docker Engine inside WSL2 (Ubuntu) and expose it via TCP
+          # so the Windows-compiled Haskell test binary can run Linux containers.
+          wsl -d Ubuntu -u root -- bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq docker.io
+            nohup dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock >/tmp/dockerd.log 2>&1 &
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              sleep 2
+              docker info >/dev/null 2>&1 && echo 'Docker ready' && break
+            done
+            docker info >/dev/null 2>&1 || (echo 'Docker failed to start'; cat /tmp/dockerd.log; exit 1)
+          "
+          # Persist DOCKER_HOST so subsequent steps use the WSL2 Linux daemon
+          "DOCKER_HOST=tcp://localhost:2375" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Verify connectivity from Windows
+          $env:DOCKER_HOST = "tcp://localhost:2375"
+          docker version
 
       - name: Test
         run: |
