@@ -672,25 +672,32 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  -- Determine the host path of the Docker socket to bind-mount into the Ryuk
-  -- container.  On Windows, Docker Desktop exposes the daemon via a named pipe;
-  -- we mount that pipe at the conventional Unix socket path inside the Linux
-  -- container.  On other platforms we mount the Unix socket directly.
-  (dockerSocketSource, dockerSocketDest) <-
+  -- Build the socket volume mount list.
+  --
+  -- On Windows, Docker Desktop 4.32+ automatically injects the Docker socket
+  -- into Linux containers at /var/run/docker.sock, so no explicit bind-mount
+  -- is needed or possible.  The Docker CLI on Windows rejects every Unix-style
+  -- or named-pipe path as an "invalid volume specification", so we pass an
+  -- empty list and let Docker Desktop handle socket forwarding automatically.
+  --
+  -- On other platforms, we bind-mount the Unix socket explicitly.  We honour
+  -- the DOCKER_HOST env var so that non-default socket locations (e.g.
+  -- Podman, Colima, custom Docker contexts) also work.
+  socketMounts <-
     liftIO $ do
       dockerHost <- lookupEnv "DOCKER_HOST"
       pure $
         if os == "mingw32"
-          then -- Windows Docker Desktop: daemon is a named pipe.
-            ("//./pipe/docker_engine", "/var/run/docker.sock")
+          then -- Docker Desktop (Windows): socket is injected automatically.
+            []
           else case dockerHost of
-            -- Explicit unix socket (e.g. "unix:///var/run/docker.sock").
+            -- Explicit unix socket, e.g. "unix:///run/podman/podman.sock".
             Just host
               | Just socket <- stripPrefix "unix://" host ->
-                  (socket, "/var/run/docker.sock")
-            -- Default: the standard Unix socket on Linux/macOS.
+                  [(pack socket, "/var/run/docker.sock")]
+            -- Default: the standard Docker socket location.
             _ ->
-              ("/var/run/docker.sock", "/var/run/docker.sock")
+              [("/var/run/docker.sock", "/var/run/docker.sock")]
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -698,7 +705,7 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketSource, pack dockerSocketDest)]
+        & setVolumeMounts socketMounts
         & setExpose [ryukPort]
         -- Wait for ryuk to log "Started" instead of probing the port.
         -- Probing the port causes a spurious connect/disconnect that triggers
