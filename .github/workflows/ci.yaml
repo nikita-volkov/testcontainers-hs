@@ -59,6 +59,14 @@ jobs:
         if: runner.os == 'macOS'
         uses: docker/setup-docker-action@v5
 
+      - name: Switch Docker to Linux containers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$Env:ProgramFiles\Docker\Docker\DockerCli.exe" -SwitchLinuxEngine
+          Start-Sleep -Seconds 10
+          docker info
+
       - name: Test
         run: |
           cabal test all
