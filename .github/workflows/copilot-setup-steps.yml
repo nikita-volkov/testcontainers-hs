@@ -1,27 +1,30 @@
-name: CI
+name: "Copilot Setup Steps"
 
-# Trigger the workflow on push or pull request, but only for the master branch
+# Automatically run the setup steps when they are changed to allow for easy validation, and
+# allow manual testing through the repository's "Actions" tab
 on:
-  pull_request:
+  workflow_dispatch:
   push:
-    branches: [master]
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
 
 jobs:
-  cabal:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: 
-          - ubuntu-latest
-          - macos-26-intel
-          - windows-latest
-        ghc:
-          - 9.8.4
-          
-    runs-on: ${{ matrix.os }}
+  # The job MUST be called `copilot-setup-steps` or it will not be picked up by Copilot.
+  copilot-setup-steps:
+    runs-on: windows-latest
 
-    name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
+    # Set the permissions to the lowest permissions possible needed for your steps.
+    # Copilot will be given its own token for its operations.
+    permissions:
+      # If you want to clone the repository as part of your setup steps, for example to install dependencies, you'll need the `contents: read` permission.
+      # If you don't clone the repository in your setup steps, Copilot will do this for you automatically after the steps complete.
+      contents: write
 
+    # You can define any steps you want, and they will run before the agent starts.
+    # If you do not check out your code, Copilot will do this for you.
     steps:
       - uses: actions/checkout@v6
 
@@ -54,11 +57,3 @@ jobs:
         with:
           path: ${{ steps.setup.outputs.cabal-store }}
           key: ${{ steps.cache.outputs.cache-primary-key }}
-
-      - name: Set up Docker
-        if: runner.os == 'macOS'
-        uses: docker/setup-docker-action@v5
-
-      - name: Test
-        run: |
-          cabal test all
