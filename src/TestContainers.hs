@@ -30,6 +30,7 @@ module TestContainers
     M.setEnv,
     M.setMemory,
     M.setCpus,
+    M.setIsolation,
     M.withWorkingDirectory,
     M.withCopyFileToContainer,
     M.withNetwork,

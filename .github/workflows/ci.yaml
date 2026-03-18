@@ -43,12 +43,12 @@ jobs:
     - name: Restore dependency cache
       id: cache
       uses: actions/cache/restore@v5
+      env:
+        key: ${{ runner.os }}-${{ steps.setup-haskell-cabal.outputs.cabal-version }}-${{ steps.setup-haskell-cabal.outputs.ghc-version }}-${{ github.job }}
       with:
         path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
-        key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
-        restore-keys: |
-          ${{ runner.os }}-${{ matrix.ghc }}-
-
+        key: ${{ env.key }}-${{ hashFiles('**/plan.json') }}
+        restore-keys: ${{ env.key }}
     - name: Build
       run: |
         cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
@@ -61,6 +61,25 @@ jobs:
       with:
         path: ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
         key: ${{ steps.cache.outputs.cache-primary-key }}
+
+    - name: Wait for Docker to be ready
+      if: runner.os == 'Windows'
+      shell: pwsh
+      # Docker service may still be starting up when fast (cached) builds complete.
+      # Poll up to 60 seconds (30 attempts × 2 s) before giving up.
+      run: |
+        $maxAttempts = 30
+        for ($i = 0; $i -lt $maxAttempts; $i++) {
+          $output = docker info 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Docker is ready"
+            exit 0
+          }
+          Write-Output "Waiting for Docker ($i/$maxAttempts)..."
+          Start-Sleep -Seconds 2
+        }
+        Write-Error "Docker did not become ready"
+        exit 1
 
     - name: Test
       run: |

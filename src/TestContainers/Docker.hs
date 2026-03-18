@@ -88,6 +88,7 @@ module TestContainers.Docker
     setVolumeMounts,
     setRm,
     setEnv,
+    setIsolation,
     withWorkingDirectory,
     withCopyFileToContainer,
     withNetwork,
@@ -184,7 +185,6 @@ import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
 import Data.List (find, stripPrefix)
-import Data.Maybe (fromMaybe)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -207,7 +207,7 @@ import Network.HTTP.Types (statusCode)
 import qualified Network.Socket as Socket
 import Optics.Fold (pre)
 import Optics.Operators ((^?))
-import Optics.Optic ((%), (<&>))
+import Optics.Optic ((%))
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.IO (Handle, hClose)
@@ -292,7 +292,8 @@ data ContainerRequest = ContainerRequest
     noReaper :: Bool,
     followLogs :: Maybe LogConsumer,
     workDirectory :: Maybe Text,
-    copyFilesToContainer :: [(FilePath, FilePath)]
+    copyFilesToContainer :: [(FilePath, FilePath)],
+    isolation :: Maybe Text
   }
 
 instance WithoutReaper ContainerRequest where
@@ -329,7 +330,8 @@ containerRequest image =
       noReaper = False,
       followLogs = Nothing,
       workDirectory = Nothing,
-      copyFilesToContainer = mempty
+      copyFilesToContainer = mempty,
+      isolation = Nothing
     }
 
 -- | Set the name of a Docker container. This is equivalent to invoking @docker run@
@@ -390,6 +392,16 @@ setMemory newMemory req =
 setCpus :: Text -> ContainerRequest -> ContainerRequest
 setCpus newCpus req =
   req {cpus = Just newCpus}
+
+-- | Set the isolation mode of the Docker container. This is equivalent to
+-- invoking @docker run@ with the @--isolation@ parameter.
+-- This option is Windows-specific. On Windows containers mode, use @"hyperv"@
+-- to enable Hyper-V isolation, which allows running containers built for
+-- different Windows versions than the host. On Linux, this option is ignored
+-- by Docker.
+setIsolation :: Text -> ContainerRequest -> ContainerRequest
+setIsolation newIsolation req =
+  req {isolation = Just newIsolation}
 
 -- | The volume mounts to link to Docker container. This is the equivalent
 -- of passing the command on the @docker run -v@ invocation.
@@ -583,7 +595,8 @@ run request = do
           noReaper,
           followLogs,
           workDirectory,
-          copyFilesToContainer
+          copyFilesToContainer,
+          isolation
         } = request
 
   config@Config {configTracer, configCreateReaper} <-
@@ -614,6 +627,7 @@ run request = do
           [["create"]]
             ++ [["--cpus", value] | Just value <- [cpus]]
             ++ [["--env", variable <> "=" <> value] | (variable, value) <- env]
+            ++ [["--isolation", mode] | Just mode <- [isolation]]
             ++ [["--label", label <> "=" <> value] | (label, value) <- additionalLabels ++ labels]
             ++ [["--link", container] | container <- links]
             ++ [["--memory", value] | Just value <- [memory]]
@@ -672,11 +686,10 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  serverOs <- dockerHostOs
+  mDockerHost <- liftIO (lookupEnv "DOCKER_HOST")
+  let (hostSocketPath, containerSocketPath) =
+        resolveDockerSocketPaths serverOs mDockerHost
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -684,7 +697,10 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts [(hostSocketPath, containerSocketPath)]
+        -- On Windows containers mode, use Hyper-V isolation so that the
+        -- ryuk container can run regardless of the host Windows build version.
+        & (if serverOs == "windows" then setIsolation "hyperv" else \req -> req)
         & setExpose [ryukPort]
         & setWaitingFor (waitUntilMappedPortReachable ryukPort)
         & setRm True
@@ -693,6 +709,28 @@ createRyukReaper = do
         containerAddress ryukContainer ryukPort
 
   newRyukReaper ryukContainerAddress ryukContainerPort
+
+-- | Resolves the Docker socket paths for the Ryuk reaper container based on
+-- the Docker server OS and the @DOCKER_HOST@ environment variable.
+--
+-- When the Docker server OS is @"windows"@ (Windows containers mode), a named
+-- pipe is used. Otherwise a Unix socket path is used.
+resolveDockerSocketPaths ::
+  -- | Docker server OS (e.g. @"windows"@ or @"linux"@)
+  Text ->
+  -- | Value of the @DOCKER_HOST@ environment variable, if set
+  Maybe String ->
+  -- | @(hostPath, containerPath)@
+  (Text, Text)
+resolveDockerSocketPaths serverOs mDockerHost
+  | serverOs == "windows" =
+      -- Windows containers mode: use the Docker Engine named pipe.
+      ("//./pipe/docker_engine", "//./pipe/docker_engine")
+  | otherwise =
+      -- Linux containers mode: use the Unix socket, respecting DOCKER_HOST.
+      case mDockerHost >>= stripPrefix "unix://" of
+        Just sockPath -> (pack sockPath, "/var/run/docker.sock")
+        Nothing -> ("/var/run/docker.sock", "/var/run/docker.sock")
 
 -- | Kills a Docker container. `kill` is essentially @docker kill@.
 --
