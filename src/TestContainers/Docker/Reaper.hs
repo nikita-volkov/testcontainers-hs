@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module TestContainers.Docker.Reaper
   ( Reaper (..),
@@ -14,8 +15,12 @@ module TestContainers.Docker.Reaper
   )
 where
 
-import Control.Monad (replicateM)
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, try)
+import Control.Monad (replicateM, void)
 import Control.Monad.Trans.Resource (MonadResource, allocate)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.Text (Text, pack, unpack)
 import Data.Text.Encoding (encodeUtf8)
 import qualified Network.Socket as Socket
@@ -58,7 +63,7 @@ newtype Ryuk = Ryuk {ryukSocket :: Socket.Socket}
 -- @since 0.5.0.0
 ryukImageTag :: Text
 ryukImageTag =
-  "docker.io/testcontainers/ryuk:0.3.4"
+  "docker.io/testcontainers/ryuk:0.14.0"
 
 -- | Exposed port for the ryuk reaper.
 --
@@ -88,12 +93,9 @@ newRyukReaper host port = do
                 Socket.defaultHints {Socket.addrSocketType = Socket.Stream}
           address <-
             head <$> Socket.getAddrInfo (Just hints) (Just (unpack host)) (Just (show port))
-          socket <-
-            Socket.socket
-              (Socket.addrFamily address)
-              (Socket.addrSocketType address)
-              (Socket.addrProtocol address)
-          Socket.connect socket (Socket.addrAddress address)
+          -- Retry connecting up to 20 times (10 s total) to tolerate the
+          -- port-forwarding setup delay on macOS / Lima-backed Docker.
+          socket <- connectWithRetry address 20
 
           -- Construct the reaper and regiter the session with it.
           -- Doing it here intead of in the teardown (like we did before)
@@ -112,6 +114,47 @@ newRyukReaper host port = do
 
   pure ryuk
 
+-- | Delay between consecutive connection retries in microseconds (500 ms).
+connectRetryDelayUs :: Int
+connectRetryDelayUs = 500000
+
+-- | Open a TCP connection. On failure, waits 'connectRetryDelayUs' and
+-- retries up to @n@ more times (so at most @n + 1@ total attempts).
+-- Throws the last 'IOException' when all attempts are exhausted.
+connectWithRetry :: Socket.AddrInfo -> Int -> IO Socket.Socket
+connectWithRetry addr = go
+  where
+    go n = do
+      socket <-
+        Socket.socket
+          (Socket.addrFamily addr)
+          (Socket.addrSocketType addr)
+          (Socket.addrProtocol addr)
+      result <- try (Socket.connect socket (Socket.addrAddress addr))
+      case result of
+        Right () ->
+          pure socket
+        Left (e :: IOException)
+          | n <= 0 -> ioError e
+          | otherwise -> do
+              Socket.close socket
+              threadDelay connectRetryDelayUs
+              go (n - 1)
+
+-- | Reads exactly @n@ bytes from a socket, retrying until all bytes are
+-- received. Throws 'IOError' if the connection is closed before @n@ bytes
+-- are available.
+recvExactly :: Socket.Socket -> Int -> IO ByteString
+recvExactly socket n = go ByteString.empty
+  where
+    go acc
+      | ByteString.length acc >= n = pure (ByteString.take n acc)
+      | otherwise = do
+          chunk <- Socket.recv socket (n - ByteString.length acc)
+          if ByteString.null chunk
+            then ioError (userError "recvExactly: connection closed before receiving all bytes")
+            else go (acc <> chunk)
+
 newReaper ::
   -- | Session id
   Text ->
@@ -123,7 +166,7 @@ newReaper sessionId ryuk =
         Socket.sendAll
           (ryukSocket ryuk)
           ("label=" <> encodeUtf8 label <> "=" <> encodeUtf8 value <> "\n")
-        _ <- Socket.recv (ryukSocket ryuk) 2
+        void $ recvExactly (ryukSocket ryuk) 4
         pure (),
       labels =
         [ (sessionIdLabel, sessionId)

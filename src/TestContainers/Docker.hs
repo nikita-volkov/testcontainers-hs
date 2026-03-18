@@ -184,7 +184,6 @@ import qualified Data.Aeson.Optics as Optics
 import qualified Data.ByteString.Lazy.Char8 as LazyByteString
 import Data.Function ((&))
 import Data.List (find, stripPrefix)
-import Data.Maybe (fromMaybe)
 import Data.String (IsString (..))
 import Data.Text (Text, pack, splitOn, strip, unpack)
 import Data.Text.Encoding (encodeUtf8)
@@ -207,7 +206,7 @@ import Network.HTTP.Types (statusCode)
 import qualified Network.Socket as Socket
 import Optics.Fold (pre)
 import Optics.Operators ((^?))
-import Optics.Optic ((%), (<&>))
+import Optics.Optic ((%))
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.IO (Handle, hClose)
@@ -672,11 +671,32 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  -- Build the socket volume mount list.
+  --
+  -- When the Docker server is running in Windows containers mode (server OS =
+  -- "windows"), Docker handles socket access differently via named pipes, so we
+  -- pass an empty list.
+  --
+  -- On all other platforms (Linux, macOS, or Windows with a Linux Docker
+  -- daemon accessed via TCP / WSL2), we bind-mount the Unix socket explicitly.
+  -- We honour the DOCKER_HOST env var so that non-default socket locations
+  -- (e.g. Podman, Colima, custom Docker contexts) also work.
+  serverOs <- dockerHostOs
+  socketMounts <-
+    liftIO $ do
+      dockerHost <- lookupEnv "DOCKER_HOST"
+      pure $
+        if serverOs == "windows"
+          then -- Windows containers mode: Docker manages socket access.
+            []
+          else case dockerHost of
+            -- Explicit unix socket, e.g. "unix:///run/podman/podman.sock".
+            Just host
+              | Just socket <- stripPrefix "unix://" host ->
+                  [(pack socket, "/var/run/docker.sock")]
+            -- Default: the standard Docker socket location.
+            _ ->
+              [("/var/run/docker.sock", "/var/run/docker.sock")]
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -684,9 +704,12 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts socketMounts
         & setExpose [ryukPort]
-        & setWaitingFor (waitUntilMappedPortReachable ryukPort)
+        -- Wait for ryuk to log "Started" instead of probing the port.
+        -- Probing the port causes a spurious connect/disconnect that triggers
+        -- ryuk's reconnection timer; using the log avoids that race.
+        & setWaitingFor (waitForLogLine Stdout ("Started" `LazyText.isInfixOf`))
         & setRm True
 
   let (ryukContainerAddress, ryukContainerPort) =
