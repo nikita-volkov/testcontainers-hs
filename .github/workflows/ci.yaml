@@ -59,6 +59,47 @@ jobs:
         if: runner.os == 'macOS'
         uses: docker/setup-docker-action@v5
 
+      - name: Set up Linux Docker on Windows via WSL2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Install Ubuntu 24.04 in WSL2 (ignore error if already installed)
+          wsl --install Ubuntu-24.04 --no-launch 2>&1 | Write-Host
+
+          # Install Docker in WSL2 if not present
+          $hasDocker = wsl -d Ubuntu-24.04 -e bash -c 'which docker 2>/dev/null && echo ok || echo no'
+          if ($hasDocker -notmatch 'ok') {
+            Write-Host 'Installing Docker in WSL2...'
+            wsl -d Ubuntu-24.04 -e bash -c 'export DEBIAN_FRONTEND=noninteractive && curl -fsSL https://get.docker.com | sh'
+          }
+
+          # Stop systemd-managed Docker and restart with TCP endpoint enabled
+          wsl -d Ubuntu-24.04 -e bash -c 'systemctl stop docker docker.socket 2>/dev/null; pkill dockerd 2>/dev/null; sleep 2'
+          wsl -d Ubuntu-24.04 -e bash -c 'nohup dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --containerd=/run/containerd/containerd.sock >/tmp/dockerd.log 2>&1 &'
+          Start-Sleep -Seconds 15
+
+          # Verify Docker is running inside WSL2
+          $osType = wsl -d Ubuntu-24.04 -e bash -c 'docker info --format "{{.OSType}}" 2>/dev/null'
+          if ($osType -notmatch 'linux') { throw "Docker not running in WSL2: $osType" }
+          Write-Host "Docker WSL2 OSType: $osType"
+
+          # Get WSL2 IP address
+          $wslIp = (wsl -d Ubuntu-24.04 -e bash -c "ip addr show eth0 | grep 'inet ' | sed 's/.*inet //' | sed 's/\///'" | ForEach-Object { $_ -replace '/.*', '' } | Select-Object -First 1).Trim()
+          Write-Host "WSL2 IP: $wslIp"
+
+          # Forward Windows localhost:2375 to WSL2:2375
+          netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=2375 connectaddress=$wslIp connectport=2375 2>&1 | Write-Host
+          Start-Sleep -Seconds 2
+
+          # Verify Docker is accessible from Windows
+          $env:DOCKER_HOST = 'tcp://127.0.0.1:2375'
+          $testOsType = docker info --format '{{.OSType}}' 2>&1
+          if ($testOsType -notmatch 'linux') { throw "Docker not accessible from Windows: $testOsType" }
+          Write-Host "Docker from Windows OSType: $testOsType"
+
+          # Export DOCKER_HOST for all subsequent steps
+          "DOCKER_HOST=tcp://127.0.0.1:2375" | Add-Content -Path $env:GITHUB_ENV
+
       - name: Test
         run: |
           cabal test all

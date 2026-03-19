@@ -672,11 +672,23 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  isLinux <- isDockerOnLinux
+  (hostMount, containerMount) <-
+    if isLinux
+      then do
+        socketLocation <-
+          liftIO $ do
+            socketOverride <- lookupEnv "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE"
+            case socketOverride of
+              Just override -> pure override
+              Nothing ->
+                lookupEnv "DOCKER_HOST"
+                  <&> (>>= stripPrefix "unix://")
+                  <&> fromMaybe "/var/run/docker.sock"
+        pure (pack socketLocation, "/var/run/docker.sock")
+      else
+        -- Windows containers mode: bind-mount the Docker named pipe
+        pure ("//./pipe/docker_engine", "//./pipe/docker_engine")
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -684,7 +696,7 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts [(hostMount, containerMount)]
         & setExpose [ryukPort]
         & setWaitingFor (waitUntilMappedPortReachable ryukPort)
         & setRm True
