@@ -51,10 +51,13 @@ jobs:
       run: cabal build all
 
     - name: Set up Docker
-      if: runner.os == 'macOS' || runner.os == 'Windows'
+      if: runner.os == 'macOS'
       uses: docker/setup-docker-action@v5
 
     - name: Test
+      # Windows-native GHC cannot run Linux containers via the Windows Docker
+      # Engine. Tests on Windows run in a separate windows-wsl2 job below.
+      if: runner.os != 'Windows'
       run: |
         cabal test all
 
@@ -89,3 +92,57 @@ jobs:
     - name: Test
       run: |
         stack test --system-ghc
+
+  windows-wsl2:
+    name: windows-wsl2 / ghc ${{ matrix.ghc }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc:
+          - "9.12"
+
+    defaults:
+      run:
+        shell: wsl-bash {0}
+
+    steps:
+    - uses: actions/checkout@v2
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+
+    - uses: Vampire/setup-wsl@v3
+      with:
+        distribution: Ubuntu-24.04
+
+    - name: Install Docker
+      run: |
+        curl -fsSL https://get.docker.com | sudo sh
+        sudo service docker start
+
+    - name: Install GHC and Cabal
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org \
+          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 sh
+        source ~/.ghcup/env
+        ghcup install ghc ${{ matrix.ghc }} --set
+        ghcup install cabal 3.14 --set
+
+    - name: Configure
+      run: |
+        source ~/.ghcup/env
+        cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
+
+    - name: Freeze
+      run: |
+        source ~/.ghcup/env
+        cabal freeze
+
+    - name: Build
+      run: |
+        source ~/.ghcup/env
+        cabal build all
+
+    - name: Test
+      run: |
+        source ~/.ghcup/env
+        cabal test all
