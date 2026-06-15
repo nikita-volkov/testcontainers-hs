@@ -120,13 +120,31 @@ jobs:
         sudo service docker start
 
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential libffi-dev libgmp-dev libncurses-dev pkg-config
+      run: sudo apt-get update && sudo apt-get install -y build-essential libffi-dev libffi8 libgmp-dev libgmp10 libncurses-dev libncurses5 libtinfo5 pkg-config
 
     - name: Install GHC and Cabal
+      env:
+        GHCRTS: "-H32m"
       run: |
+        sudo sysctl -w vm.overcommit_memory=1 || true
+        uname -r
+        free -h
         curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org \
-          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 BOOTSTRAP_HASKELL_GHC_VERSION=${{ matrix.ghc }} sh
+          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 BOOTSTRAP_HASKELL_MINIMAL=1 sh
         source ~/.ghcup/env
+        # WSL2's kernel returns EINVAL for flock(), which breaks ghc-pkg recache
+        # during GHC installation. ghcup calls `gmake install` on GHC's Makefile,
+        # which calls `ghc-pkg recache` without --no-lock. Intercept `gmake` via a
+        # wrapper earlier in PATH that patches the Makefile to add --no-lock.
+        printf '#!/bin/bash\nif [ -f Makefile ]; then sed -i "s/ recache$/ recache --no-lock/" Makefile 2>/dev/null || true; fi\nexec /usr/bin/make "$@"\n' > /usr/local/bin/gmake
+        chmod +x /usr/local/bin/gmake
+        ghcup --verbose install ghc ${{ matrix.ghc }} --set || {
+          echo '=== ghcup logs ==='
+          find /root/.ghcup/logs -type f | while IFS= read -r f; do
+            printf '\n=== %s ===\n' "$f"; cat "$f"
+          done
+          exit 1
+        }
         ghcup install cabal 3.14 --set
 
     - name: Configure
