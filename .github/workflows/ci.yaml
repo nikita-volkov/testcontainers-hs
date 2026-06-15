@@ -119,12 +119,14 @@ jobs:
         curl -fsSL https://get.docker.com | sudo sh
         sudo service docker start
 
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential libffi-dev libgmp-dev libncurses-dev pkg-config
+
     - name: Install GHC and Cabal
       run: |
         curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org \
-          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 sh
+          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 BOOTSTRAP_HASKELL_GHC_VERSION=${{ matrix.ghc }} sh
         source ~/.ghcup/env
-        ghcup install ghc ${{ matrix.ghc }} --set
         ghcup install cabal 3.14 --set
 
     - name: Configure
