@@ -11,29 +11,35 @@ jobs:
     name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest] # [macOS-latest, windows-latest] do not come with docker :(
-        cabal: ["3.12.1.0"]
+        os: 
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-26-intel
+          - windows-latest
+        cabal:
+          - "3.14"
         ghc:
-          - 9.2.8
-          - 9.4.8
-          - 9.6.4
-          - 9.8.2
+          - "9.2"
+          - "9.12"
 
     steps:
     - uses: actions/checkout@v2
       if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
 
-    - uses: haskell-actions/setup@v2.6.1
+    - uses: haskell-actions/setup@v2
       id: setup-haskell-cabal
       name: Setup Haskell
       with:
         ghc-version: ${{ matrix.ghc }}
         cabal-version: ${{ matrix.cabal }}
 
+    - name: Configure
+      run: cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
+
     - name: Freeze
-      run: |
-        cabal freeze
+      run: cabal freeze
 
     - uses: actions/cache@v3
       name: Cache ~/.cabal/store
@@ -42,11 +48,17 @@ jobs:
         key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
 
     - name: Build
-      run: |
-        cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
-        cabal build all
+      run: cabal build all
+
+    - name: Set up Docker
+      if: runner.os == 'macOS'
+      uses: docker/setup-docker-action@v5
 
     - name: Test
+      # GitHub-hosted Windows runners have no Linux Docker daemon, so the
+      # Docker-dependent test suite cannot run there. The Build step above still
+      # verifies the library compiles on Windows.
+      if: runner.os != 'Windows'
       run: |
         cabal test all
 
