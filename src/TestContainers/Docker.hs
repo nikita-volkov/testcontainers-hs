@@ -670,11 +670,24 @@ run request = do
 -- @since 0.5.0.0
 createRyukReaper :: TestContainer Reaper
 createRyukReaper = do
-  dockerSocketLocation <-
-    liftIO $
-      lookupEnv "DOCKER_HOST"
-        <&> (>>= stripPrefix "unix://")
-        <&> fromMaybe "/var/run/docker.sock"
+  -- Ryuk needs access to the Docker daemon socket to reap resources. The way
+  -- that socket is exposed depends on whether the daemon runs Linux or Windows
+  -- containers. Docker automatically selects the matching ryuk image variant
+  -- from the multi-arch manifest based on the daemon's OS.
+  dockerSocketMount <- do
+    onLinux <- isDockerOnLinux
+    if onLinux
+      then do
+        dockerSocketLocation <-
+          liftIO $
+            lookupEnv "DOCKER_HOST"
+              <&> (>>= stripPrefix "unix://")
+              <&> fromMaybe "/var/run/docker.sock"
+        pure (pack dockerSocketLocation, "/var/run/docker.sock")
+      else
+        -- Windows containers talk to the daemon through the named pipe rather
+        -- than a unix socket. This is what the windows/amd64 ryuk build expects.
+        pure ("\\\\.\\pipe\\docker_engine", "\\\\.\\pipe\\docker_engine")
   ryukContainer <-
     run $
       containerRequest (fromTag ryukImageTag)
@@ -682,9 +695,14 @@ createRyukReaper = do
         -- Ryuk destroys itself once it reaped the resources,
         -- no need to register itself with itself.
         withoutReaper
-        & setVolumeMounts [(pack dockerSocketLocation, "/var/run/docker.sock")]
+        & setVolumeMounts [dockerSocketMount]
         & setExpose [ryukPort]
-        & setWaitingFor (waitUntilMappedPortReachable ryukPort)
+        -- Wait for ryuk's own startup log rather than probing its port.
+        -- A TCP probe (waitUntilMappedPortReachable) registers as a client
+        -- that immediately disconnects without sending any labels; ryuk 0.14.0
+        -- treats this as a completed session and exits with its 1 ns
+        -- reconnection timeout, so the subsequent real connection gets RST.
+        & setWaitingFor (waitForLogLine Stdout ("Started" `LazyText.isInfixOf`))
         & setRm True
 
   let (ryukContainerAddress, ryukContainerPort) =
@@ -786,11 +804,20 @@ defaultToImage action =
 fromTag :: ImageTag -> ToImage
 fromTag tag = defaultToImage $ do
   tracer <- askTracer
-  output <- docker tracer ["pull", "--quiet", tag]
-  return $
-    Image
-      { tag = strip (pack output)
-      }
+  pullWithRetry tracer 3
+  where
+    pull tracer = do
+      output <- docker tracer ["pull", "--quiet", tag]
+      pure $ Image {tag = strip (pack output)}
+    pullWithRetry :: Tracer -> Int -> TestContainer Image
+    pullWithRetry tracer 0 = pull tracer
+    pullWithRetry tracer n = do
+      result <- try (pull tracer)
+      case result of
+        Right image -> pure image
+        Left (_ :: DockerException) -> do
+          liftIO (threadDelay 2000000)
+          pullWithRetry tracer (n - 1)
 
 -- | Get an `Image` from an image id. This doesn't run @docker pull@ or any other Docker command
 -- on construction.
@@ -1104,9 +1131,13 @@ waitForLogLine whereToLook matches = waitWithLogs $ \Container {id} stdout stder
 waitUntilReady :: Container -> WaitUntilReady -> TestContainer ()
 waitUntilReady container@Container {id} input = do
   Config {configDefaultWaitTimeout} <- ask
-  interpreter $ case configDefaultWaitTimeout of
-    Just seconds -> waitUntilTimeout seconds input
-    Nothing -> input
+  interpreter $ case input of
+    WaitUntilTimeout {} ->
+      input
+    _ ->
+      case configDefaultWaitTimeout of
+        Just seconds -> waitUntilTimeout seconds input
+        Nothing -> input
   where
     interpreter :: WaitUntilReady -> TestContainer ()
     interpreter wait =

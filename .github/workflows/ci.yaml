@@ -11,29 +11,35 @@ jobs:
     name: ${{ matrix.os }} / ghc ${{ matrix.ghc }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest] # [macOS-latest, windows-latest] do not come with docker :(
-        cabal: ["3.12.1.0"]
+        os: 
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-26-intel
+          - windows-latest
+        cabal:
+          - "3.14"
         ghc:
-          - 9.2.8
-          - 9.4.8
-          - 9.6.4
-          - 9.8.2
+          - "9.2"
+          - "9.12"
 
     steps:
     - uses: actions/checkout@v2
       if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
 
-    - uses: haskell-actions/setup@v2.6.1
+    - uses: haskell-actions/setup@v2
       id: setup-haskell-cabal
       name: Setup Haskell
       with:
         ghc-version: ${{ matrix.ghc }}
         cabal-version: ${{ matrix.cabal }}
 
+    - name: Configure
+      run: cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
+
     - name: Freeze
-      run: |
-        cabal freeze
+      run: cabal freeze
 
     - uses: actions/cache@v3
       name: Cache ~/.cabal/store
@@ -42,11 +48,16 @@ jobs:
         key: ${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
 
     - name: Build
-      run: |
-        cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
-        cabal build all
+      run: cabal build all
+
+    - name: Set up Docker
+      if: runner.os == 'macOS'
+      uses: docker/setup-docker-action@v5
 
     - name: Test
+      # Windows-native GHC cannot run Linux containers via the Windows Docker
+      # Engine. Tests on Windows run in a separate windows-wsl2 job below.
+      if: runner.os != 'Windows'
       run: |
         cabal test all
 
@@ -81,3 +92,77 @@ jobs:
     - name: Test
       run: |
         stack test --system-ghc
+
+  windows-wsl2:
+    name: windows-wsl2 / ghc ${{ matrix.ghc }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc:
+          - "9.12"
+
+    defaults:
+      run:
+        shell: wsl-bash {0}
+
+    steps:
+    - uses: actions/checkout@v2
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+
+    - uses: Vampire/setup-wsl@v3
+      with:
+        distribution: Ubuntu-22.04
+
+    - name: Install Docker
+      run: |
+        curl -fsSL https://get.docker.com | sudo sh
+        sudo service docker start
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y build-essential libffi-dev libffi8 libgmp-dev libgmp10 libncurses-dev libncurses5 libtinfo5 pkg-config
+
+    - name: Install GHC and Cabal
+      env:
+        GHCRTS: "-H32m"
+      run: |
+        sudo sysctl -w vm.overcommit_memory=1 || true
+        uname -r
+        free -h
+        curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org \
+          | BOOTSTRAP_HASKELL_NONINTERACTIVE=1 BOOTSTRAP_HASKELL_MINIMAL=1 sh
+        source ~/.ghcup/env
+        # WSL2's kernel returns EINVAL for flock(), which breaks ghc-pkg recache
+        # during GHC installation. ghcup calls `gmake install` on GHC's Makefile,
+        # which calls `ghc-pkg recache` without --no-lock. Intercept `gmake` via a
+        # wrapper earlier in PATH that patches the Makefile to add --no-lock.
+        printf '#!/bin/bash\nif [ -f Makefile ]; then sed -i "s/ recache$/ recache --no-lock/" Makefile 2>/dev/null || true; fi\nexec /usr/bin/make "$@"\n' > /usr/local/bin/gmake
+        chmod +x /usr/local/bin/gmake
+        ghcup --verbose install ghc ${{ matrix.ghc }} --set || {
+          echo '=== ghcup logs ==='
+          find /root/.ghcup/logs -type f | while IFS= read -r f; do
+            printf '\n=== %s ===\n' "$f"; cat "$f"
+          done
+          exit 1
+        }
+        ghcup install cabal 3.14 --set
+
+    - name: Configure
+      run: |
+        source ~/.ghcup/env
+        cabal configure -O0 --enable-tests --enable-benchmarks --test-show-details=direct
+
+    - name: Freeze
+      run: |
+        source ~/.ghcup/env
+        cabal freeze
+
+    - name: Build
+      run: |
+        source ~/.ghcup/env
+        cabal build all
+
+    - name: Test
+      run: |
+        source ~/.ghcup/env
+        cabal test all
