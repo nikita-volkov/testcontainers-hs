@@ -2,6 +2,8 @@
 
 module TestContainers.Docker.ReuseIntegrationSpec (test_reuse) where
 
+import Control.Monad.IO.Class (liftIO)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit
 import TestContainers.Docker (containerId)
@@ -34,5 +36,25 @@ test_reuse =
           rm first
           rm second
           pure (containerId first, containerId second)
-        assertBool "expected different container ids" (firstId /= secondId)
+        assertBool "expected different container ids" (firstId /= secondId),
+      testCase "adopting an existing container does not invoke `docker pull`" $ do
+        config <- determineConfig
+        traceLog <- newIORef []
+        let tracingConfig =
+              config
+                { configTracer = newTracer (\trace -> modifyIORef' traceLog (trace :))
+                }
+        (firstId, secondId) <- runTestContainer tracingConfig $ do
+          let request = containerRequest redis & withReuse
+          first <- run request
+          -- Only the second `run` -- the adoption -- is under test.
+          liftIO (writeIORef traceLog [])
+          second <- run request
+          rm second
+          pure (containerId first, containerId second)
+        firstId @?= secondId
+        trace <- readIORef traceLog
+        let pullInvocations =
+              [dockerArgs | TraceDockerInvocation dockerArgs _ _ <- trace, take 1 dockerArgs == ["pull"]]
+        assertEqual "adoption should not invoke `docker pull`" [] pullInvocations
     ]

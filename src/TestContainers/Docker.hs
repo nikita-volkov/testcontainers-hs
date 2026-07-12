@@ -582,6 +582,21 @@ setWaitingFor :: WaitUntilReady -> ContainerRequest -> ContainerRequest
 setWaitingFor newWaitingFor req =
   req {readiness = newWaitingFor}
 
+-- | Outcome of attempting to adopt a running container for a reusing
+-- request, carrying forward just enough already-computed state that the
+-- container-creation path in 'run' never redoes work.
+data ReuseOutcome
+  = -- | An existing container was adopted, along with the 'Image' its
+    -- identity hash was computed from (resolved from a cheap hint when
+    -- possible, so adoption never pays for a Docker pull/build it doesn't
+    -- need).
+    Adopted ContainerId Image
+  | -- | No adoptable container was found (or reuse wasn't requested).
+    -- Carries the 'Image' resolved along the way, if resolving it was
+    -- unavoidable, and the reuse hash to stamp on the container about to be
+    -- created, if reuse was requested.
+    NotAdopted (Maybe Image) (Maybe Text)
+
 -- | Runs a Docker container from an `Image` and `ContainerRequest`. A finalizer
 -- is registered so that the container is aways stopped when it goes out of scope.
 -- This function is essentially @docker run@.
@@ -614,8 +629,6 @@ run request = do
   config@Config {configTracer, configCreateReaper} <-
     ask
 
-  image@Image {tag} <- runToImage toImage
-
   let resolvedNetwork :: Maybe Text
       resolvedNetwork =
         case network of
@@ -623,40 +636,51 @@ run request = do
           Just (Left dockerNetwork) -> Just (networkId dockerNetwork)
           Nothing -> Nothing
 
-  -- The hash is computed before the reaper's per-session label is ever added
-  -- (below, and only when `noReaper` is False -- `withReuse` always implies
-  -- `withoutReaper`), so it stays stable across separate process runs.
-  reuseHash <-
+  -- When reusing, look for an adoptable container before resolving
+  -- `toImage`: adoption never needs the image pulled or built, so we only
+  -- pay for that when `toImage` can't offer a cheap identity hint (e.g.
+  -- `fromBuildContext`) or when no adoptable container turns up below. The
+  -- hash itself is computed before the reaper's per-session label is ever
+  -- added (below, and only when `noReaper` is False -- `withReuse` always
+  -- implies `withoutReaper`), so it stays stable across separate process
+  -- runs.
+  reuseOutcome <-
     if reuse
       then do
         copiedFilesHash <- liftIO (Reuse.hashCopiedFiles copyFilesToContainer)
-        pure $
-          Just $
-            Reuse.containerIdentityHash
-              Reuse.ContainerIdentity
-                { image = tag,
-                  cmd,
-                  env,
-                  exposedPorts = map (pack . show) exposedPorts,
-                  volumeMounts,
-                  network = resolvedNetwork,
-                  networkAlias,
-                  cpus,
-                  memory,
-                  links,
-                  workDirectory,
-                  labels,
-                  copiedFilesHash
-                }
-      else pure Nothing
+        (imageIdentity, alreadyResolvedImage) <-
+          case toImageIdentity toImage of
+            Just identity -> pure (identity, Nothing)
+            Nothing -> do
+              image <- runToImage toImage
+              pure (imageTag image, Just image)
+        let hash =
+              Reuse.containerIdentityHash
+                Reuse.ContainerIdentity
+                  { image = imageIdentity,
+                    cmd,
+                    env,
+                    exposedPorts = map (pack . show) exposedPorts,
+                    volumeMounts,
+                    network = resolvedNetwork,
+                    networkAlias,
+                    cpus,
+                    memory,
+                    links,
+                    workDirectory,
+                    labels,
+                    copiedFilesHash
+                  }
+        adoptedId <- lookupReusableContainer configTracer hash
+        pure $ case adoptedId of
+          -- Adopted without ever resolving `toImage`: synthesize an `Image`
+          -- from the cheap identity hint instead.
+          Just id -> Adopted id (fromMaybe Image {tag = imageIdentity} alreadyResolvedImage)
+          Nothing -> NotAdopted alreadyResolvedImage (Just hash)
+      else pure (NotAdopted Nothing Nothing)
 
-  existingContainerId <-
-    case reuseHash of
-      Just hash -> lookupReusableContainer configTracer hash
-      Nothing -> pure Nothing
-
-  let finalizeContainer :: ContainerId -> TestContainer Container
-      finalizeContainer id = do
+  let finalizeContainer :: Image -> ContainerId -> TestContainer Container
+      finalizeContainer image id = do
         let -- Careful, this is really meant to be lazy
             ~inspectOutput =
               unsafePerformIO $
@@ -683,13 +707,15 @@ run request = do
 
         pure container
 
-  case existingContainerId of
+  case reuseOutcome of
     -- A still-running container was already stamped with this hash. Adopt it
     -- as-is: skip `docker create`/`docker cp`/`docker start` entirely, since
     -- an identical request already went through them.
-    Just id ->
-      finalizeContainer id
-    Nothing -> do
+    Adopted id image ->
+      finalizeContainer image id
+    NotAdopted alreadyResolvedImage reuseHash -> do
+      image@Image {tag} <- maybe (runToImage toImage) pure alreadyResolvedImage
+
       additionalLabels <-
         if noReaper
           then do
@@ -745,7 +771,7 @@ run request = do
 
       void $ docker configTracer dockerStart
 
-      finalizeContainer id
+      finalizeContainer image id
 
 -- | Looks up a still-running container previously stamped with the given
 -- reuse hash label. Returns the first match, if any.
@@ -876,7 +902,16 @@ type ImageTag = Text
 --
 -- @since 0.1.0.0
 data ToImage = ToImage
-  { runToImage :: TestContainer Image
+  { runToImage :: TestContainer Image,
+    -- | A cheap stand-in for the tag 'runToImage' would resolve to, usable
+    -- to compute a container reuse hash without invoking 'runToImage' (and
+    -- hence without whatever Docker command it wraps, e.g. a pull or a
+    -- build). 'Nothing' when no such shortcut exists (e.g.
+    -- 'fromBuildContext'), in which case reuse falls back to running
+    -- 'runToImage' up front, same as non-reusing requests always have.
+    --
+    -- @since 0.5.5.0
+    toImageIdentity :: Maybe Text
   }
 
 -- | Build the `Image` referred to by the argument. If the construction of the
@@ -890,7 +925,8 @@ build toImage = do
   image <- runToImage toImage
   return $
     toImage
-      { runToImage = pure image
+      { runToImage = pure image,
+        toImageIdentity = Just (imageTag image)
       }
 
 -- | Default `ToImage`. Doesn't apply anything to to `ContainerRequests`.
@@ -899,16 +935,21 @@ build toImage = do
 defaultToImage :: TestContainer Image -> ToImage
 defaultToImage action =
   ToImage
-    { runToImage = action
+    { runToImage = action,
+      toImageIdentity = Nothing
     }
 
 -- | Get an `Image` from a tag. This runs @docker pull --quiet <tag>@ to obtain an image id.
 --
 -- @since 0.1.0.0
 fromTag :: ImageTag -> ToImage
-fromTag tag = defaultToImage $ do
-  tracer <- askTracer
-  pullWithRetry tracer 3
+fromTag tag =
+  (defaultToImage $ do
+     tracer <- askTracer
+     pullWithRetry tracer 3
+  )
+    { toImageIdentity = Just tag
+    }
   where
     pull tracer = do
       output <- docker tracer ["pull", "--quiet", tag]
@@ -929,8 +970,9 @@ fromTag tag = defaultToImage $ do
 -- @since 0.5.1.0
 fromImageId :: Text -> ToImage
 fromImageId imageId =
-  defaultToImage $
-    pure Image {tag = imageId}
+  (defaultToImage (pure Image {tag = imageId}))
+    { toImageIdentity = Just imageId
+    }
 
 -- | Build the image from a build path and an optional path to the
 -- Dockerfile (default is Dockerfile)
