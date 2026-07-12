@@ -77,6 +77,9 @@ module TestContainers.Docker
     ContainerRequest,
     containerRequest,
     withoutReaper,
+    withReuse,
+    Reuse.reuseHashLabel,
+    Reuse.reuseDiscoverabilityLabel,
     withLabels,
     setName,
     setFixedName,
@@ -249,6 +252,7 @@ import TestContainers.Docker.Reaper
     ryukImageTag,
     ryukPort,
   )
+import qualified TestContainers.Docker.Reuse as Reuse
 import TestContainers.Docker.State
   ( State,
     Status (..),
@@ -290,7 +294,8 @@ data ContainerRequest = ContainerRequest
     noReaper :: Bool,
     followLogs :: Maybe LogConsumer,
     workDirectory :: Maybe Text,
-    copyFilesToContainer :: [(FilePath, FilePath)]
+    copyFilesToContainer :: [(FilePath, FilePath)],
+    reuse :: Bool
   }
 
 instance WithoutReaper ContainerRequest where
@@ -327,7 +332,8 @@ containerRequest image =
       noReaper = False,
       followLogs = Nothing,
       workDirectory = Nothing,
-      copyFilesToContainer = mempty
+      copyFilesToContainer = mempty,
+      reuse = False
     }
 
 -- | Set the name of a Docker container. This is equivalent to invoking @docker run@
@@ -477,6 +483,27 @@ withFollowLogs :: LogConsumer -> ContainerRequest -> ContainerRequest
 withFollowLogs logConsumer request =
   request {followLogs = Just logConsumer}
 
+-- | Marks the request as reusable: 'run' hashes its create-relevant fields
+-- and, if a still-running container stamped with a matching hash already
+-- exists, adopts it instead of creating a new one. Otherwise a new container
+-- is created and stamped with the hash for future runs to find.
+--
+-- Reused containers are never registered with the resource reaper (implies
+-- 'withoutReaper') — a reused container must outlive the process that
+-- created it, and the reaper's per-session label would otherwise make the
+-- hash unstable across runs anyway.
+--
+-- There is deliberately no idle-timeout or TTL cleanup, mirroring
+-- Testcontainers-Java's own reuse feature: reused containers run until
+-- manually stopped. Find them with:
+--
+-- >>> docker ps --filter label=org.testcontainers.hs.reuse=true
+--
+-- @since 0.5.5.0
+withReuse :: ContainerRequest -> ContainerRequest
+withReuse request =
+  (withoutReaper request) {reuse = True}
+
 -- | Defintion of a 'Port'. Allows for specifying ports using various protocols. Due to the
 -- 'Num' and 'IsString' instance allows for convenient Haskell literals.
 --
@@ -581,89 +608,167 @@ run request = do
           noReaper,
           followLogs,
           workDirectory,
-          copyFilesToContainer
+          copyFilesToContainer,
+          reuse
         } = request
 
   config@Config {configTracer, configCreateReaper} <-
     ask
 
-  additionalLabels <-
-    if noReaper
-      then do
-        pure []
-      else reaperLabels <$> configCreateReaper
-
   image@Image {tag} <- runToImage toImage
 
-  name <-
-    case naming of
-      RandomName -> return Nothing
-      FixedName n -> return $ Just n
-      SuffixedName prefix ->
-        Just . (prefix <>) . ("-" <>) . pack
-          <$> replicateM 6 (Random.randomRIO ('a', 'z'))
+  let resolvedNetwork :: Maybe Text
+      resolvedNetwork =
+        case network of
+          Just (Right networkName) -> Just networkName
+          Just (Left dockerNetwork) -> Just (networkId dockerNetwork)
+          Nothing -> Nothing
 
-  -- Instead of using `docker run`, we use the more manual `docker create` + `docker start`.
-  -- This allows to get the container ID early from `docker create`, and thus
-  -- optionally copy files using `docker cp`.
-  let dockerCreate :: [Text]
-      dockerCreate =
-        concat $
-          [["create"]]
-            ++ [["--cpus", value] | Just value <- [cpus]]
-            ++ [["--env", variable <> "=" <> value] | (variable, value) <- env]
-            ++ [["--label", label <> "=" <> value] | (label, value) <- additionalLabels ++ labels]
-            ++ [["--link", container] | container <- links]
-            ++ [["--memory", value] | Just value <- [memory]]
-            ++ [["--name", containerName] | Just containerName <- [name]]
-            ++ [["--network", networkName] | Just (Right networkName) <- [network]]
-            ++ [["--network", networkId dockerNetwork] | Just (Left dockerNetwork) <- [network]]
-            ++ [["--network-alias", alias] | Just alias <- [networkAlias]]
-            ++ [["--publish", pack (show port) <> "/" <> protocol] | Port {port, protocol} <- exposedPorts]
-            ++ [["--rm"] | rmOnExit]
-            ++ [["--volume", src <> ":" <> dest] | (src, dest) <- volumeMounts]
-            ++ [["--workdir", workdir] | Just workdir <- [workDirectory]]
-            ++ [[tag]]
+  -- The hash is computed before the reaper's per-session label is ever added
+  -- (below, and only when `noReaper` is False -- `withReuse` always implies
+  -- `withoutReaper`), so it stays stable across separate process runs.
+  reuseHash <-
+    if reuse
+      then do
+        copiedFilesHash <- liftIO (Reuse.hashCopiedFiles copyFilesToContainer)
+        pure $
+          Just $
+            Reuse.containerIdentityHash
+              Reuse.ContainerIdentity
+                { image = tag,
+                  cmd,
+                  env,
+                  exposedPorts = map (pack . show) exposedPorts,
+                  volumeMounts,
+                  network = resolvedNetwork,
+                  networkAlias,
+                  cpus,
+                  memory,
+                  links,
+                  workDirectory,
+                  labels,
+                  copiedFilesHash
+                }
+      else pure Nothing
 
-  (id :: ContainerId) <- strip . pack <$> docker configTracer dockerCreate
+  existingContainerId <-
+    case reuseHash of
+      Just hash -> lookupReusableContainer configTracer hash
+      Nothing -> pure Nothing
 
-  forM_ copyFilesToContainer $ \(hostFile, containerFile) ->
-    docker configTracer ["cp", pack hostFile, id <> ":" <> pack containerFile]
+  let finalizeContainer :: ContainerId -> TestContainer Container
+      finalizeContainer id = do
+        let -- Careful, this is really meant to be lazy
+            ~inspectOutput =
+              unsafePerformIO $
+                internalInspect configTracer id
 
-  let dockerStart :: [Text]
-      dockerStart =
-        concat $
-          [["start"]]
-            ++ [[id]]
-            ++ [command | Just command <- [cmd]]
+        -- We don't issue 'ReleaseKeys' for cleanup anymore. Ryuk takes care of cleanup
+        -- for us once the session has been closed.
+        releaseKey <- register (pure ())
 
-  void $ docker configTracer dockerStart
+        let container =
+              Container
+                { id,
+                  releaseKey,
+                  image,
+                  inspectOutput,
+                  config
+                }
 
-  let -- Careful, this is really meant to be lazy
-      ~inspectOutput =
-        unsafePerformIO $
-          internalInspect configTracer id
+        -- Last but not least, execute the WaitUntilReady checks
+        waitUntilReady container readiness
 
-  -- We don't issue 'ReleaseKeys' for cleanup anymore. Ryuk takes care of cleanup
-  -- for us once the session has been closed.
-  releaseKey <- register (pure ())
+        pure container
 
-  forM_ followLogs $
-    dockerFollowLogs configTracer id
+  case existingContainerId of
+    -- A still-running container was already stamped with this hash. Adopt it
+    -- as-is: skip `docker create`/`docker cp`/`docker start` entirely, since
+    -- an identical request already went through them.
+    Just id ->
+      finalizeContainer id
+    Nothing -> do
+      additionalLabels <-
+        if noReaper
+          then do
+            pure []
+          else reaperLabels <$> configCreateReaper
 
-  let container =
-        Container
-          { id,
-            releaseKey,
-            image,
-            inspectOutput,
-            config
-          }
+      let reuseLabels :: [(Text, Text)]
+          reuseLabels =
+            case reuseHash of
+              Just hash -> [(Reuse.reuseHashLabel, hash), Reuse.reuseDiscoverabilityLabel]
+              Nothing -> []
 
-  -- Last but not least, execute the WaitUntilReady checks
-  waitUntilReady container readiness
+      name <-
+        case naming of
+          RandomName -> return Nothing
+          FixedName n -> return $ Just n
+          SuffixedName prefix ->
+            Just . (prefix <>) . ("-" <>) . pack
+              <$> replicateM 6 (Random.randomRIO ('a', 'z'))
 
-  pure container
+      -- Instead of using `docker run`, we use the more manual `docker create` + `docker start`.
+      -- This allows to get the container ID early from `docker create`, and thus
+      -- optionally copy files using `docker cp`.
+      let dockerCreate :: [Text]
+          dockerCreate =
+            concat $
+              [["create"]]
+                ++ [["--cpus", value] | Just value <- [cpus]]
+                ++ [["--env", variable <> "=" <> value] | (variable, value) <- env]
+                ++ [["--label", label <> "=" <> value] | (label, value) <- additionalLabels ++ reuseLabels ++ labels]
+                ++ [["--link", container] | container <- links]
+                ++ [["--memory", value] | Just value <- [memory]]
+                ++ [["--name", containerName] | Just containerName <- [name]]
+                ++ [["--network", networkName] | Just networkName <- [resolvedNetwork]]
+                ++ [["--network-alias", alias] | Just alias <- [networkAlias]]
+                ++ [["--publish", pack (show port) <> "/" <> protocol] | Port {port, protocol} <- exposedPorts]
+                ++ [["--rm"] | rmOnExit]
+                ++ [["--volume", src <> ":" <> dest] | (src, dest) <- volumeMounts]
+                ++ [["--workdir", workdir] | Just workdir <- [workDirectory]]
+                ++ [[tag]]
+
+      (id :: ContainerId) <- strip . pack <$> docker configTracer dockerCreate
+
+      forM_ copyFilesToContainer $ \(hostFile, containerFile) ->
+        docker configTracer ["cp", pack hostFile, id <> ":" <> pack containerFile]
+
+      let dockerStart :: [Text]
+          dockerStart =
+            concat $
+              [["start"]]
+                ++ [[id]]
+                ++ [command | Just command <- [cmd]]
+
+      void $ docker configTracer dockerStart
+
+      forM_ followLogs $
+        dockerFollowLogs configTracer id
+
+      finalizeContainer id
+
+-- | Looks up a still-running container previously stamped with the given
+-- reuse hash label. Returns the first match, if any.
+lookupReusableContainer :: Tracer -> Text -> TestContainer (Maybe ContainerId)
+lookupReusableContainer tracer hash = do
+  output <-
+    docker
+      tracer
+      [ "ps",
+        "--filter",
+        "label=" <> Reuse.reuseHashLabel <> "=" <> hash,
+        "--filter",
+        "status=running",
+        "--last",
+        "1",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}"
+      ]
+  pure $ case filter (/= "") (map (strip . pack) (Prelude.lines output)) of
+    (matchedId : _) -> Just matchedId
+    [] -> Nothing
 
 -- | Sets up a Ryuk 'Reaper'.
 --
