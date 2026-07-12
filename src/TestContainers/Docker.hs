@@ -78,8 +78,6 @@ module TestContainers.Docker
     containerRequest,
     withoutReaper,
     withReuse,
-    Reuse.reuseHashLabel,
-    Reuse.reuseDiscoverabilityLabel,
     withLabels,
     setName,
     setFixedName,
@@ -489,9 +487,10 @@ withFollowLogs logConsumer request =
 -- is created and stamped with the hash for future runs to find.
 --
 -- Reused containers are never registered with the resource reaper (implies
--- 'withoutReaper') — a reused container must outlive the process that
--- created it, and the reaper's per-session label would otherwise make the
--- hash unstable across runs anyway.
+-- 'withoutReaper') and are never passed @--rm@ (overrides 'setRm') — a
+-- reused container must outlive the process that created it, and the
+-- reaper's per-session label would otherwise make the hash unstable across
+-- runs anyway.
 --
 -- There is deliberately no idle-timeout or TTL cleanup, mirroring
 -- Testcontainers-Java's own reuse feature: reused containers run until
@@ -502,7 +501,7 @@ withFollowLogs logConsumer request =
 -- @since 0.5.5.0
 withReuse :: ContainerRequest -> ContainerRequest
 withReuse request =
-  (withoutReaper request) {reuse = True}
+  (withoutReaper request) {reuse = True, rmOnExit = False}
 
 -- | Defintion of a 'Port'. Allows for specifying ports using various protocols. Due to the
 -- 'Num' and 'IsString' instance allows for convenient Haskell literals.
@@ -667,6 +666,9 @@ run request = do
         -- for us once the session has been closed.
         releaseKey <- register (pure ())
 
+        forM_ followLogs $
+          dockerFollowLogs configTracer id
+
         let container =
               Container
                 { id,
@@ -742,9 +744,6 @@ run request = do
                 ++ [command | Just command <- [cmd]]
 
       void $ docker configTracer dockerStart
-
-      forM_ followLogs $
-        dockerFollowLogs configTracer id
 
       finalizeContainer id
 

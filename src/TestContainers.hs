@@ -21,8 +21,6 @@ module TestContainers
     M.containerRequest,
     M.withoutReaper,
     M.withReuse,
-    M.reuseHashLabel,
-    M.reuseDiscoverabilityLabel,
     M.setName,
     M.setFixedName,
     M.setSuffixedName,
