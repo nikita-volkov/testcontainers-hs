@@ -944,9 +944,9 @@ defaultToImage action =
 -- @since 0.1.0.0
 fromTag :: ImageTag -> ToImage
 fromTag tag =
-  (defaultToImage $ do
-     tracer <- askTracer
-     pullWithRetry tracer 3
+  ( defaultToImage $ do
+      tracer <- askTracer
+      pullWithRetry tracer 3
   )
     { toImageIdentity = Just tag
     }

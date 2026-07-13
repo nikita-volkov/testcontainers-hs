@@ -14,6 +14,7 @@ module TestContainers.Docker.Reuse
   )
 where
 
+import Crypto.Hash (SHA1 (SHA1), hashWith)
 import Data.Aeson (ToJSON (toJSON), object, (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as ByteString
@@ -21,7 +22,6 @@ import Data.ByteString.Lazy (toStrict)
 import Data.List (sort)
 import Data.Text (Text, pack)
 import Data.Text.Encoding (encodeUtf8)
-import Crypto.Hash (SHA1 (SHA1), hashWith)
 
 -- | The subset of a 'TestContainers.Docker.ContainerRequest''s fields that
 -- determine whether two requests would create an identical container.
